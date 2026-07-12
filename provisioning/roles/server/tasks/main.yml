@@ -1,0 +1,225 @@
+- name: Install base packages
+  apt:
+    name:
+      - sudo
+      - vim
+      - tree
+      - curl
+      - nftables
+      - openssh-server
+      - python3
+      - wireshark
+    state: present
+    update_cache: true
+
+- name: Enable and start ssh
+  systemd:
+    name: ssh
+    enabled: true
+    state: started
+
+- name: Ermittle die MAC-Adresse des Clients dynamisch
+  set_fact:
+    client_mac: >-
+      {%- set mac = "" -%}
+      {%- for interface in hostvars['client']['ansible_interfaces'] -%}
+        {%- set interface_info = hostvars['client']['ansible_' ~ interface | replace('-', '_')] -%}
+        {%- if interface_info and interface_info.ipv4 is defined and interface_info.ipv4.address == client_ip -%}
+          {{- interface_info.macaddress -}}
+        {%- endif -%}
+      {%- endfor -%}
+  failed_when: client_mac | trim == ""
+
+- name: Configure network
+  copy:
+    dest: /etc/network/interfaces
+    content: |
+      source /etc/network/interfaces.d/*
+
+      auto lo
+      iface lo inet loopback
+
+      allow-hotplug enp0s3
+      iface enp0s3 inet dhcp
+
+      allow-hotplug enp0s8
+      iface enp0s8 inet static
+      address {{ server_ip }}/24
+
+- name: Create lab directory
+  file:
+    path: /opt/WiSpi
+    state: directory
+    mode: "0755"
+
+- name: Create user named user
+  user:
+    name: user
+    shell: /bin/bash
+    create_home: true
+    state: present
+
+# --- NEU: SSH-Verzeichnis und authorized_keys erstellen ---
+- name: Ensure .ssh directory exists for user
+  file:
+    path: /home/user/.ssh
+    state: directory
+    owner: user
+    group: user
+    mode: "0700"
+
+- name: Create empty authorized_keys file
+  file:
+    path: /home/user/.ssh/authorized_keys
+    state: touch
+    owner: user
+    group: user
+    mode: "0600"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Generate OpenSSH keypair for user
+  community.crypto.openssh_keypair:
+    path: /home/user/.ssh/id_ed25519
+    type: ed25519
+    owner: user
+    group: user
+    mode: "0600" # Betrifft den Private Key
+    comment: "user@{{ ansible_facts['hostname'] }}"
+# ---------------------------------------------------------
+
+- name: Place flag
+  copy:
+    dest: '/home/user/flag.txt'
+    owner: user
+    content: "{{ flag }}\n"
+    mode: '0600'
+
+- name: Place second flag
+  copy:
+    dest: '/root.txt'
+    owner: root
+    content: "{{ flag_2 }}\n"
+    mode: '0600'
+
+- name: Stelle sicher, dass der User in der sudo-Gruppe
+  ansible.builtin.user:
+    name: user
+    groups: sudo
+    append: yes
+
+- name: Erlaube nur cat ohne Passworteingabe
+  ansible.builtin.copy:
+    content: "user ALL=(ALL) NOPASSWD: /usr/bin/cat"
+    dest: /etc/sudoers.d/user_privileges
+    owner: root
+    group: root
+    mode: '0440'
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Install simple web server with PUT support
+  copy:
+    dest: /opt/WiSpi/server.py
+    mode: "0755"
+    content: |
+      #!/usr/bin/env python3
+      from http.server import SimpleHTTPRequestHandler, HTTPServer
+      import os
+
+      class PUTRequestHandler(SimpleHTTPRequestHandler):
+          def do_PUT(self):
+              # Ermittelt den Pfad, an den die Datei geschrieben werden soll
+              path = self.translate_path(self.path)
+              
+              # Holt die Länge der hochzuladenden Daten aus dem Header
+              length = int(self.headers['Content-Length'])
+              
+              try:
+                  # Erstellt die Ordnerstruktur, falls sie noch nicht existiert
+                  os.makedirs(os.path.dirname(path), exist_ok=True)
+                  
+                  # Schreibt die Daten in die Datei
+                  with open(path, 'wb') as f:
+                      f.write(self.rfile.read(length))
+                  
+                  # Sendet eine Erfolgsmeldung zurück (201 Created)
+                  self.send_response(201)
+                  self.end_headers()
+                  self.wfile.write(b"File created/updated successfully.\n")
+              except Exception as e:
+                  # Fehlerbehandlung (500 Internal Server Error)
+                  self.send_response(500)
+                  self.end_headers()
+                  self.wfile.write(f"Error: {str(e)}\n".encode())
+
+      # Wechselt in das gewünschte Verzeichnis
+      os.chdir("/home/user")
+      
+      # Startet den Server mit unserem neuen Handler
+      HTTPServer(("0.0.0.0", 80), PUTRequestHandler).serve_forever()
+
+- name: Configure nftables
+  copy:
+    dest: /etc/nftables.conf
+    mode: "0644"
+    content: |
+      #!/usr/sbin/nft -f
+      flush ruleset
+
+      table inet filter {
+        chain input {
+          type filter hook input priority 0; policy accept;
+
+          ct state related,established accept;
+          iif lo accept;
+
+          icmp type echo-request ether saddr != {{ client_mac }} counter reject with icmpx type port-unreachable;
+          tcp dport 80 ether saddr != {{ client_mac }} counter reject;
+          tcp dport 22 counter accept;
+        }
+
+        chain forward {
+          type filter hook forward priority 0; policy drop;
+        }
+
+        chain output {
+          type filter hook output priority 0; policy drop;
+          ct state related,established accept;
+          oif lo accept;
+          icmp type echo-request counter accept;
+        }
+      }
+
+- name: Enable nftables
+  systemd:
+    name: nftables
+    enabled: true
+    state: restarted
+
+- name: Install web server systemd unit
+  copy:
+    dest: /etc/systemd/system/wispi-web.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=WiSpi Web Server
+      After=network.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory=/home/user
+      ExecStart=/usr/bin/python3 /opt/WiSpi/server.py 80
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: true
+
+- name: Enable and start web server
+  systemd:
+    name: wispi-web
+    enabled: true
+    state: started
