@@ -1,0 +1,42 @@
+- name: Install tools
+  apt:
+    name:
+      - wireshark
+      - curl
+    state: present
+    update_cache: true
+
+- name: Install traffic generator script on client
+  copy:
+    dest: /opt/traffic_gen.sh
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      while true; do
+        curl -s http://10.10.30.7/flag.txt > /dev/null
+        sleep 5
+      done
+
+- name: Create systemd service for traffic generator
+  copy:
+    dest: /etc/systemd/system/traffic-gen.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Simulate Client Traffic to Server
+      After=network.target
+
+      [Service]
+      Type=simple
+      ExecStart=/bin/bash /opt/traffic_gen.sh
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Start traffic generator service
+  systemd:
+    name: traffic-gen
+    state: started
+    enabled: true
+    daemon_reload: true
