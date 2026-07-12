@@ -1,0 +1,18 @@
+- hosts: client
+  become: true
+  roles:
+    - client
+
+- name: set up server
+  hosts: server
+  become: yes
+  roles:
+    - name: server
+      vars:
+        flag: "FLAG({{ user_flag }}) - Hinweis: Wie funktioniert ssh ohne Passworteingabe?"
+        flag_2: "FLAG({{ root_flag }})"
+
+- hosts: home
+  become: true
+  roles:
+    - kali
