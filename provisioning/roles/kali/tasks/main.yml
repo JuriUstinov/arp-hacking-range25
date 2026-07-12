@@ -1,0 +1,37 @@
+- name: Install attacker tools
+  apt:
+    name:
+      - wireshark
+      - tcpdump
+      - arping
+      - net-tools
+      - iproute2
+      - curl
+      - nmap
+    state: present
+    update_cache: true
+
+- name: Allow kali user to use sudo without a password
+  copy:
+    content: "kali ALL=(ALL) NOPASSWD:ALL\n"
+    dest: /etc/sudoers.d/kali
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Konfiguriere das Macvlan-Interface dauerhaft in den Netzwerkeinstellungen
+  ansible.builtin.blockinfile:
+    path: /etc/network/interfaces.d/attack0
+    create: true
+    mode: "0644"
+    block: |
+      auto attack0
+      iface attack0 inet static
+          address 10.10.30.8
+          netmask 255.255.255.0
+          pre-up ip link add link eth1 name attack0 type macvlan mode bridge
+          post-down ip link del dev attack0
+
+- name: Starte den Netzwerkdienst neu, um das Interface direkt zu laden
+  ansible.builtin.systemd:
+    name: networking
+    state: restarted
